@@ -12,6 +12,7 @@ import (
 	logger "github.com/sirupsen/logrus"
 
 	"github.com/envoyproxy/ratelimit/src/server"
+	"github.com/envoyproxy/ratelimit/src/utils"
 )
 
 type poolStats struct {
@@ -35,7 +36,10 @@ func poolTrace(ps *poolStats, healthCheckActiveConnection bool, srv server.Serve
 				ps.connectionTotal.Add(1)
 				ps.connectionActive.Add(1)
 				if healthCheckActiveConnection && srv != nil {
-					srv.HealthCheckOK()
+					err := srv.HealthChecker().Ok(server.RedisHealthComponentName)
+					if err != nil {
+						logger.Errorf("Unable to update health status: %s", err)
+					}
 				}
 			} else {
 				fmt.Println("creating redis connection error :", newConn.Err)
@@ -45,7 +49,10 @@ func poolTrace(ps *poolStats, healthCheckActiveConnection bool, srv server.Serve
 			ps.connectionActive.Sub(1)
 			ps.connectionClose.Add(1)
 			if healthCheckActiveConnection && srv != nil && ps.connectionActive.Value() == 0 {
-				srv.HealthCheckFail()
+				err := srv.HealthChecker().Fail(server.RedisHealthComponentName)
+				if err != nil {
+					logger.Errorf("Unable to update health status: %s", err)
+				}
 			}
 		},
 	}
@@ -65,23 +72,25 @@ func checkError(err error) {
 
 func NewClientImpl(scope stats.Scope, useTls bool, auth, redisSocketType, redisType, url string, poolSize int,
 	pipelineWindow time.Duration, pipelineLimit int, tlsConfig *tls.Config, healthCheckActiveConnection bool, srv server.Server) Client {
-	logger.Warnf("connecting to redis on %s with pool size %d", url, poolSize)
+	maskedUrl := utils.MaskCredentialsInUrl(url)
+	logger.Warnf("connecting to redis on %s with pool size %d", maskedUrl, poolSize)
 
 	df := func(network, addr string) (radix.Conn, error) {
 		var dialOpts []radix.DialOpt
 
 		if useTls {
-			if tlsConfig != nil {
-				dialOpts = append(dialOpts, radix.DialUseTLS(tlsConfig))
-			} else {
-				dialOpts = append(dialOpts, radix.DialUseTLS(&tls.Config{}))
-			}
+			dialOpts = append(dialOpts, radix.DialUseTLS(tlsConfig))
 		}
 
 		if auth != "" {
-			logger.Warnf("enabling authentication to redis on %s", url)
-
-			dialOpts = append(dialOpts, radix.DialAuthPass(auth))
+			user, pass, found := strings.Cut(auth, ":")
+			if found {
+				logger.Warnf("enabling authentication to redis on %s with user %s", maskedUrl, user)
+				dialOpts = append(dialOpts, radix.DialAuthUser(user, pass))
+			} else {
+				logger.Warnf("enabling authentication to redis on %s without user", maskedUrl)
+				dialOpts = append(dialOpts, radix.DialAuthPass(auth))
+			}
 		}
 
 		return radix.Dial(network, addr, dialOpts...)

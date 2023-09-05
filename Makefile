@@ -7,6 +7,10 @@ MODULE = github.com/envoyproxy/ratelimit
 GIT_REF = $(shell git describe --tags --exact-match 2>/dev/null || git rev-parse --short=8 --verify HEAD)
 VERSION ?= $(GIT_REF)
 SHELL := /bin/bash
+BUILDX_PLATFORMS := linux/amd64,linux/arm64/v8
+# Root dir returns absolute path of current directory. It has a trailing "/".
+PROJECT_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+export PROJECT_DIR
 
 .PHONY: bootstrap
 bootstrap: ;
@@ -25,17 +29,29 @@ pid = /var/run/stunnel-2.pid
 accept = 127.0.0.1:16382
 connect = 127.0.0.1:6382
 endef
+define REDIS_VERIFY_PEER_STUNNEL
+cert = private.pem
+pid = /var/run/stunnel-3.pid
+[redis]
+CAfile = cert.pem
+accept = 127.0.0.1:16361
+connect = 127.0.0.1:6361
+endef
 export REDIS_STUNNEL
 export REDIS_PER_SECOND_STUNNEL
+export REDIS_VERIFY_PEER_STUNNEL
 redis.conf:
 	echo "$$REDIS_STUNNEL" >> $@
 redis-per-second.conf:
 	echo "$$REDIS_PER_SECOND_STUNNEL" >> $@
+redis-verify-peer.conf:
+	echo "$$REDIS_VERIFY_PEER_STUNNEL" >> $@
 
 .PHONY: bootstrap_redis_tls
-bootstrap_redis_tls: redis.conf redis-per-second.conf
+bootstrap_redis_tls: redis.conf redis-per-second.conf redis-verify-peer.conf
 	openssl req -new -newkey rsa:4096 -days 365 -nodes -x509 \
     -subj "/C=US/ST=Denial/L=Springfield/O=Dis/CN=localhost" \
+    -addext "subjectAltName = DNS:localhost" \
     -keyout key.pem  -out cert.pem
 	cat key.pem cert.pem > private.pem
 	sudo cp cert.pem /usr/local/share/ca-certificates/redis-stunnel.crt
@@ -43,6 +59,7 @@ bootstrap_redis_tls: redis.conf redis-per-second.conf
 	sudo update-ca-certificates
 	sudo stunnel redis.conf
 	sudo stunnel redis-per-second.conf
+	sudo stunnel redis-verify-peer.conf
 .PHONY: docs_format
 docs_format:
 	script/docs_check_format
@@ -75,6 +92,7 @@ tests: compile
 tests_with_redis: bootstrap_redis_tls tests_unit
 	redis-server --port 6381 --requirepass password123 &
 	redis-server --port 6382 --requirepass password123 &
+	redis-server --port 6361 --requirepass password123 &
 
 	redis-server --port 6392 --requirepass password123 &
 	redis-server --port 6393 --requirepass password123 --slaveof 127.0.0.1 6392 --masterauth password123 &
@@ -114,9 +132,17 @@ docker_image: docker_tests
 docker_push: docker_image
 	docker push $(IMAGE):$(VERSION)
 
+.PHONY: docker_multiarch_image
+docker_multiarch_image: docker_tests
+	docker buildx build -t $(IMAGE):$(VERSION) --platform $(BUILDX_PLATFORMS) .
+
+.PHONY: docker_multiarch_push
+docker_multiarch_push: docker_multiarch_image
+	docker buildx build -t $(IMAGE):$(VERSION) --platform $(BUILDX_PLATFORMS) --push .
+
 .PHONY: integration_tests
 integration_tests:
-	docker-compose --project-dir $(PWD)  -f integration-test/docker-compose-integration-test.yml up --build  --exit-code-from tester
+	docker-compose --project-directory $(PWD)  -f integration-test/docker-compose-integration-test.yml up --build  --exit-code-from tester
 
 .PHONY: precommit_install
 precommit_install:

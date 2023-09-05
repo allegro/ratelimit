@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"expvar"
 	"fmt"
 	"io"
@@ -10,14 +11,15 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"sync"
 	"syscall"
 
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 
+	"github.com/envoyproxy/ratelimit/src/provider"
 	"github.com/envoyproxy/ratelimit/src/stats"
 
 	"github.com/coocood/freecache"
@@ -34,7 +36,14 @@ import (
 
 	"github.com/envoyproxy/ratelimit/src/limiter"
 	"github.com/envoyproxy/ratelimit/src/settings"
+
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
+
+var tracer = otel.Tracer("ratelimit server")
 
 type serverDebugListener struct {
 	endpoints map[string]string
@@ -50,6 +59,7 @@ type server struct {
 	grpcServer    *grpc.Server
 	store         gostats.Store
 	scope         gostats.Scope
+	provider      provider.RateLimitConfigProvider
 	runtime       loader.IFace
 	debugListener serverDebugListener
 	httpServer    *http.Server
@@ -75,18 +85,28 @@ func NewJsonHandler(svc pb.RateLimitServiceServer) func(http.ResponseWriter, *ht
 	return func(writer http.ResponseWriter, request *http.Request) {
 		var req pb.RateLimitRequest
 
+		ctx := context.Background()
+
 		if err := jsonpb.Unmarshal(request.Body, &req); err != nil {
 			logger.Warnf("error: %s", err.Error())
 			http.Error(writer, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		resp, err := svc.ShouldRateLimit(nil, &req)
+		resp, err := svc.ShouldRateLimit(ctx, &req)
 		if err != nil {
 			logger.Warnf("error: %s", err.Error())
 			http.Error(writer, err.Error(), http.StatusBadRequest)
 			return
 		}
+
+		// Generate trace
+		_, span := tracer.Start(ctx, "NewJsonHandler Remaining Execution",
+			trace.WithAttributes(
+				attribute.String("response", resp.String()),
+			),
+		)
+		defer span.End()
 
 		logger.Debugf("resp:%s", resp)
 
@@ -105,6 +125,18 @@ func NewJsonHandler(svc pb.RateLimitServiceServer) func(http.ResponseWriter, *ht
 			writer.WriteHeader(http.StatusTooManyRequests)
 		}
 		writer.Write(buf.Bytes())
+	}
+}
+
+func getProviderImpl(s settings.Settings, statsManager stats.Manager, rootStore gostats.Store) provider.RateLimitConfigProvider {
+	switch s.ConfigType {
+	case "FILE":
+		return provider.NewFileProvider(s, statsManager, rootStore)
+	case "GRPC_XDS_SOTW":
+		return provider.NewXdsGrpcSotwProvider(s, statsManager)
+	default:
+		logger.Fatalf("Invalid setting for ConfigType: %s", s.ConfigType)
+		panic("This line should not be reachable")
 	}
 }
 
@@ -165,8 +197,8 @@ func (server *server) Scope() gostats.Scope {
 	return server.scope
 }
 
-func (server *server) Runtime() loader.IFace {
-	return server.runtime
+func (server *server) Provider() provider.RateLimitConfigProvider {
+	return server.provider
 }
 
 func NewServer(s settings.Settings, name string, statsManager stats.Manager, localCache *freecache.Cache, opts ...settings.Option) Server {
@@ -184,8 +216,23 @@ func newServer(s settings.Settings, name string, statsManager stats.Manager, loc
 		MaxConnectionAge:      s.GrpcMaxConnectionAge,
 		MaxConnectionAgeGrace: s.GrpcMaxConnectionAgeGrace,
 	})
-
-	ret.grpcServer = grpc.NewServer(s.GrpcUnaryInterceptor, keepaliveOpt)
+	grpcOptions := []grpc.ServerOption{
+		keepaliveOpt,
+		grpc.ChainUnaryInterceptor(
+			s.GrpcUnaryInterceptor, // chain otel interceptor after the input interceptor
+			otelgrpc.UnaryServerInterceptor(),
+		),
+		grpc.StreamInterceptor(otelgrpc.StreamServerInterceptor()),
+	}
+	if s.GrpcServerUseTLS {
+		grpcServerTlsConfig := s.GrpcServerTlsConfig
+		// Verify client SAN if provided
+		if s.GrpcClientTlsSAN != "" {
+			grpcServerTlsConfig.VerifyPeerCertificate = verifyClient(grpcServerTlsConfig.ClientCAs, s.GrpcClientTlsSAN)
+		}
+		grpcOptions = append(grpcOptions, grpc.Creds(credentials.NewTLS(grpcServerTlsConfig)))
+	}
+	ret.grpcServer = grpc.NewServer(grpcOptions...)
 
 	// setup listen addresses
 	ret.httpAddress = net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
@@ -200,35 +247,14 @@ func newServer(s settings.Settings, name string, statsManager stats.Manager, loc
 		ret.store.AddStatGenerator(limiter.NewLocalCacheStats(localCache, ret.scope.Scope("localcache")))
 	}
 
-	// setup runtime
-	loaderOpts := make([]loader.Option, 0, 1)
-	if s.RuntimeIgnoreDotFiles {
-		loaderOpts = append(loaderOpts, loader.IgnoreDotFiles)
-	} else {
-		loaderOpts = append(loaderOpts, loader.AllowDotFiles)
-	}
-
-	if s.RuntimeWatchRoot {
-		ret.runtime = loader.New(
-			s.RuntimePath,
-			s.RuntimeSubdirectory,
-			ret.store.ScopeWithTags("runtime", s.ExtraTags),
-			&loader.SymlinkRefresher{RuntimePath: s.RuntimePath},
-			loaderOpts...)
-	} else {
-		ret.runtime = loader.New(
-			filepath.Join(s.RuntimePath, s.RuntimeSubdirectory),
-			"config",
-			ret.store.ScopeWithTags("runtime", s.ExtraTags),
-			&loader.DirectoryRefresher{},
-			loaderOpts...)
-	}
+	// setup config provider
+	ret.provider = getProviderImpl(s, statsManager, ret.store)
 
 	// setup http router
 	ret.router = mux.NewRouter()
 
 	// setup healthcheck path
-	ret.health = NewHealthChecker(health.NewServer(), "ratelimit")
+	ret.health = NewHealthChecker(health.NewServer(), "ratelimit", s.HealthyWithAtLeastOneConfigLoaded)
 	ret.router.Path("/healthcheck").Handler(ret.health)
 	healthpb.RegisterHealthServer(ret.grpcServer, ret.health.Server())
 
@@ -297,6 +323,7 @@ func (server *server) Stop() {
 	if server.httpServer != nil {
 		server.httpServer.Close()
 	}
+	server.provider.Stop()
 }
 
 func (server *server) handleGracefulShutdown() {
@@ -312,10 +339,6 @@ func (server *server) handleGracefulShutdown() {
 	}()
 }
 
-func (server *server) HealthCheckFail() {
-	server.health.Fail()
-}
-
-func (server *server) HealthCheckOK() {
-	server.health.Ok()
+func (server *server) HealthChecker() *HealthChecker {
+	return server.health
 }

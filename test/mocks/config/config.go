@@ -66,6 +66,20 @@ func (mr *MockRateLimitConfigMockRecorder) GetLimit(arg0, arg1, arg2 interface{}
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetLimit", reflect.TypeOf((*MockRateLimitConfig)(nil).GetLimit), arg0, arg1, arg2)
 }
 
+// IsEmptyDomains mocks base method
+func (m *MockRateLimitConfig) IsEmptyDomains() bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "IsEmptyDomains")
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// IsEmptyDomains indicates an expected call of IsEmptyDomains
+func (mr *MockRateLimitConfigMockRecorder) IsEmptyDomains() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IsEmptyDomains", reflect.TypeOf((*MockRateLimitConfig)(nil).IsEmptyDomains))
+}
+
 // MockRateLimitConfigLoader is a mock of RateLimitConfigLoader interface
 type MockRateLimitConfigLoader struct {
 	ctrl     *gomock.Controller
@@ -90,15 +104,15 @@ func (m *MockRateLimitConfigLoader) EXPECT() *MockRateLimitConfigLoaderMockRecor
 }
 
 // Load mocks base method
-func (m *MockRateLimitConfigLoader) Load(arg0 []config.RateLimitConfigToLoad, arg1 stats.Manager) config.RateLimitConfig {
+func (m *MockRateLimitConfigLoader) Load(arg0 []config.RateLimitConfigToLoad, arg1 stats.Manager, arg2 bool) config.RateLimitConfig {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Load", arg0, arg1)
+	ret := m.ctrl.Call(m, "Load", arg0, arg1, arg2)
 	ret0, _ := ret[0].(config.RateLimitConfig)
 	return ret0
 }
 
 // Load indicates an expected call of Load
-func (mr *MockRateLimitConfigLoaderMockRecorder) Load(arg0, arg1 interface{}) *gomock.Call {
+func (mr *MockRateLimitConfigLoaderMockRecorder) Load(arg0, arg1, arg2 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Load", reflect.TypeOf((*MockRateLimitConfigLoader)(nil).Load), arg0, arg1)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Load", reflect.TypeOf((*MockRateLimitConfigLoader)(nil).Load), arg0, arg1, arg2)
 }

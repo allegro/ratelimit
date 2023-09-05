@@ -1,12 +1,14 @@
-// +build integration
+//go:build integration
 
 package integration_test
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -17,12 +19,16 @@ import (
 	"github.com/stretchr/testify/assert"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 
 	"github.com/envoyproxy/ratelimit/src/memcached"
 	"github.com/envoyproxy/ratelimit/src/service_cmd/runner"
 	"github.com/envoyproxy/ratelimit/src/settings"
+	"github.com/envoyproxy/ratelimit/src/utils"
 	"github.com/envoyproxy/ratelimit/test/common"
 )
+
+var projectDir = os.Getenv("PROJECT_DIR")
 
 func init() {
 	os.Setenv("USE_STATSD", "false")
@@ -42,6 +48,7 @@ func defaultSettings() settings.Settings {
 	// Set some convenient defaults for all integration tests.
 	s.RuntimePath = "runtime/current"
 	s.RuntimeSubdirectory = "ratelimit"
+	s.RuntimeAppDirectory = "config"
 	s.RedisPerSecondSocketType = "tcp"
 	s.RedisSocketType = "tcp"
 	s.DebugPort = 8084
@@ -86,6 +93,20 @@ func TestBasicConfig(t *testing.T) {
 		cacheSettings := makeSimpleRedisSettings(6383, 6380, false, 0)
 		cacheSettings.CacheKeyPrefix = "prefix:"
 		t.Run("WithoutPerSecondRedisWithCachePrefix", testBasicConfig(cacheSettings))
+	})
+}
+
+func TestXdsProviderBasicConfig(t *testing.T) {
+	common.WithMultiRedis(t, []common.RedisConfig{
+		{Port: 6383},
+		{Port: 6380},
+	}, func() {
+		_, cancel := startXdsSotwServer(t)
+		defer cancel()
+		t.Run("WithoutPerSecondRedis", testXdsProviderBasicConfig(false, 0))
+		t.Run("WithPerSecondRedis", testXdsProviderBasicConfig(true, 0))
+		t.Run("WithoutPerSecondRedisWithLocalCache", testXdsProviderBasicConfig(false, 1000))
+		t.Run("WithPerSecondRedisWithLocalCache", testXdsProviderBasicConfig(true, 1000))
 	})
 }
 
@@ -135,6 +156,9 @@ func TestBasicTLSConfig(t *testing.T) {
 	t.Run("WithPerSecondRedisTLS", testBasicConfigAuthTLS(true, 0))
 	t.Run("WithoutPerSecondRedisTLSWithLocalCache", testBasicConfigAuthTLS(false, 1000))
 	t.Run("WithPerSecondRedisTLSWithLocalCache", testBasicConfigAuthTLS(true, 1000))
+
+	// Test using client cert.
+	t.Run("WithoutPerSecondRedisTLSWithClientCert", testBasicConfigAuthTLSWithClientCert(false, 0))
 }
 
 func TestBasicAuthConfig(t *testing.T) {
@@ -169,6 +193,17 @@ func TestBasicReloadConfig(t *testing.T) {
 	}, func() {
 		t.Run("BasicWithoutWatchRoot", testBasicConfigWithoutWatchRoot(false, 0))
 		t.Run("ReloadWithoutWatchRoot", testBasicConfigReload(false, 0, false))
+	})
+}
+
+func TestXdsProviderBasicConfigReload(t *testing.T) {
+	common.WithMultiRedis(t, []common.RedisConfig{
+		{Port: 6383},
+	}, func() {
+		setSnapshotFunc, cancel := startXdsSotwServer(t)
+		defer cancel()
+
+		t.Run("ReloadConfigWithXdsServer", testXdsProviderBasicConfigReload(setSnapshotFunc, false, 0))
 	})
 }
 
@@ -234,13 +269,57 @@ func TestMultiNodeMemcache(t *testing.T) {
 	})
 }
 
+func Test_mTLS(t *testing.T) {
+	s := makeSimpleRedisSettings(16381, 16382, false, 0)
+	s.RedisTlsConfig = &tls.Config{}
+	s.RedisAuth = "password123"
+	s.RedisTls = true
+	s.RedisTlsSkipHostnameVerification = false
+	s.RedisPerSecondAuth = "password123"
+	s.RedisPerSecondTls = true
+	assert := assert.New(t)
+	serverCAFile, serverCertFile, serverCertKey, err := mTLSSetup(utils.ServerCA)
+	assert.NoError(err)
+	clientCAFile, clientCertFile, clientCertKey, err := mTLSSetup(utils.ClientCA)
+	assert.NoError(err)
+	s.GrpcServerUseTLS = true
+	s.GrpcServerTlsCert = serverCertFile
+	s.GrpcServerTlsKey = serverCertKey
+	s.GrpcClientTlsCACert = clientCAFile
+	s.GrpcClientTlsSAN = "localhost"
+	settings.GrpcServerTlsConfig()(&s)
+	runner := startTestRunner(t, s)
+	defer runner.Stop()
+	clientTlsConfig := utils.TlsConfigFromFiles(clientCertFile, clientCertKey, serverCAFile, utils.ServerCA, false)
+	conn, err := grpc.Dial(fmt.Sprintf("localhost:%v", s.GrpcPort), grpc.WithTransportCredentials(credentials.NewTLS(clientTlsConfig)))
+	assert.NoError(err)
+	defer conn.Close()
+}
+
 func testBasicConfigAuthTLS(perSecond bool, local_cache_size int) func(*testing.T) {
 	s := makeSimpleRedisSettings(16381, 16382, perSecond, local_cache_size)
-	s.RedisTlsConfig = nil
+	s.RedisTlsConfig = &tls.Config{}
 	s.RedisAuth = "password123"
 	s.RedisTls = true
 	s.RedisPerSecondAuth = "password123"
 	s.RedisPerSecondTls = true
+
+	return testBasicBaseConfig(s)
+}
+
+func testBasicConfigAuthTLSWithClientCert(perSecond bool, local_cache_size int) func(*testing.T) {
+	// "16361" is the port of the redis server running behind stunnel with verify level 2 (the level 2
+	// verifies the peer certificate against the defined CA certificate (CAfile)).
+	// See: Makefile#REDIS_VERIFY_PEER_STUNNEL.
+	s := makeSimpleRedisSettings(16361, 16382, perSecond, local_cache_size)
+	s.RedisTlsClientCert = filepath.Join(projectDir, "cert.pem")
+	s.RedisTlsClientKey = filepath.Join(projectDir, "key.pem")
+	s.RedisTlsCACert = filepath.Join(projectDir, "cert.pem")
+	s.RedisTls = true
+	s.RedisPerSecondTls = true
+	settings.RedisTlsConfig(s.RedisTls || s.RedisPerSecondTls)(&s)
+	s.RedisAuth = "password123"
+	s.RedisPerSecondAuth = "password123"
 
 	return testBasicBaseConfig(s)
 }
@@ -342,7 +421,7 @@ func testBasicConfigWithoutWatchRootWithRedisSentinel(perSecond bool, local_cach
 func testBasicConfigReload(perSecond bool, local_cache_size int, runtimeWatchRoot bool) func(*testing.T) {
 	s := makeSimpleRedisSettings(6383, 6380, perSecond, local_cache_size)
 	s.RuntimeWatchRoot = runtimeWatchRoot
-	return testConfigReload(s)
+	return testConfigReload(s, reloadNewConfigFile, restoreConfigFile)
 }
 
 func testBasicConfigReloadWithRedisCluster(perSecond bool, local_cache_size int, runtimeWatchRoot string) func(*testing.T) {
@@ -356,7 +435,7 @@ func testBasicConfigReloadWithRedisCluster(perSecond bool, local_cache_size int,
 
 	configRedisCluster(&s)
 
-	return testConfigReload(s)
+	return testConfigReload(s, reloadNewConfigFile, restoreConfigFile)
 }
 
 func testBasicConfigReloadWithRedisSentinel(perSecond bool, local_cache_size int, runtimeWatchRoot bool) func(*testing.T) {
@@ -370,7 +449,7 @@ func testBasicConfigReloadWithRedisSentinel(perSecond bool, local_cache_size int
 
 	s.RuntimeWatchRoot = runtimeWatchRoot
 
-	return testConfigReload(s)
+	return testConfigReload(s, reloadNewConfigFile, restoreConfigFile)
 }
 
 func getCacheKey(cacheKey string, enableLocalCache bool) string {
@@ -526,6 +605,11 @@ func testBasicBaseConfig(s settings.Settings) func(*testing.T) {
 			if i >= 10 {
 				status = pb.RateLimitResponse_OVER_LIMIT
 				limitRemaining2 = 0
+				// Ceased incrementing cached keys upon exceeding the overall rate limit in the Redis cache flow.
+				// Consequently, the remaining limit should remain unaltered.
+				if enable_local_cache && s.BackendType != "memcache" {
+					limitRemaining1 = 9
+				}
 			}
 			durRemaining1 := response.GetStatuses()[0].DurationUntilReset
 			durRemaining2 := response.GetStatuses()[1].DurationUntilReset
@@ -632,7 +716,7 @@ func startTestRunner(t *testing.T, s settings.Settings) *runner.Runner {
 	return &runner
 }
 
-func testConfigReload(s settings.Settings) func(*testing.T) {
+func testConfigReload(s settings.Settings, reloadConfFunc, restoreConfFunc func()) func(*testing.T) {
 	return func(t *testing.T) {
 		enable_local_cache := s.LocalCacheSizeInBytes > 0
 		runner := startTestRunner(t, s)
@@ -657,48 +741,13 @@ func testConfigReload(s settings.Settings) func(*testing.T) {
 		assert.NoError(err)
 
 		runner.GetStatsStore().Flush()
-		loadCount1 := runner.GetStatsStore().NewCounter("ratelimit.service.config_load_success").Value()
+		loadCountBefore := runner.GetStatsStore().NewCounter("ratelimit.service.config_load_success").Value()
 
-		// Copy a new file to config folder to test config reload functionality
-		in, err := os.Open("runtime/current/ratelimit/reload.yaml")
-		if err != nil {
-			panic(err)
-		}
-		defer in.Close()
-		out, err := os.Create("runtime/current/ratelimit/config/reload.yaml")
-		if err != nil {
-			panic(err)
-		}
-		defer out.Close()
-		_, err = io.Copy(out, in)
-		if err != nil {
-			panic(err)
-		}
-		err = out.Close()
-		if err != nil {
-			panic(err)
-		}
-
-		// Need to wait for config reload to take place and new descriptors to be loaded.
-		// Shouldn't take more than 5 seconds but wait 120 at most just to be safe.
-		wait := 120
-		reloaded := false
-		loadCount2 := uint64(0)
-
-		for i := 0; i < wait; i++ {
-			time.Sleep(1 * time.Second)
-			runner.GetStatsStore().Flush()
-			loadCount2 = runner.GetStatsStore().NewCounter("ratelimit.service.config_load_success").Value()
-
-			// Check that successful loads count has increased before continuing.
-			if loadCount2 > loadCount1 {
-				reloaded = true
-				break
-			}
-		}
+		reloadConfFunc()
+		loadCountAfter, reloaded := waitForConfigReload(runner, loadCountBefore)
 
 		assert.True(reloaded)
-		assert.Greater(loadCount2, loadCount1)
+		assert.Greater(loadCountAfter, loadCountBefore)
 
 		response, err = c.ShouldRateLimit(
 			context.Background(),
@@ -716,9 +765,61 @@ func testConfigReload(s settings.Settings) func(*testing.T) {
 			response)
 		assert.NoError(err)
 
-		err = os.Remove("runtime/current/ratelimit/config/reload.yaml")
-		if err != nil {
-			panic(err)
+		restoreConfFunc()
+		// Removal of config files must trigger a reload
+		loadCountBefore = loadCountAfter
+		loadCountAfter, reloaded = waitForConfigReload(runner, loadCountBefore)
+		assert.True(reloaded)
+		assert.Greater(loadCountAfter, loadCountBefore)
+	}
+}
+
+func reloadNewConfigFile() {
+	// Copy a new file to config folder to test config reload functionality
+	in, err := os.Open("runtime/current/ratelimit/reload.yaml")
+	if err != nil {
+		panic(err)
+	}
+	defer in.Close()
+	out, err := os.Create("runtime/current/ratelimit/config/reload.yaml")
+	if err != nil {
+		panic(err)
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	if err != nil {
+		panic(err)
+	}
+	err = out.Close()
+	if err != nil {
+		panic(err)
+	}
+}
+
+func restoreConfigFile() {
+	err := os.Remove("runtime/current/ratelimit/config/reload.yaml")
+	if err != nil {
+		panic(err)
+	}
+}
+
+func waitForConfigReload(runner *runner.Runner, loadCountBefore uint64) (uint64, bool) {
+	// Need to wait for config reload to take place and new descriptors to be loaded.
+	// Shouldn't take more than 5 seconds but wait 120 at most just to be safe.
+	wait := 120
+	reloaded := false
+	loadCountAfter := uint64(0)
+
+	for i := 0; i < wait; i++ {
+		time.Sleep(1 * time.Second)
+		runner.GetStatsStore().Flush()
+		loadCountAfter = runner.GetStatsStore().NewCounter("ratelimit.service.config_load_success").Value()
+
+		// Check that successful loads count has increased before continuing.
+		if loadCountAfter > loadCountBefore {
+			reloaded = true
+			break
 		}
 	}
+	return loadCountAfter, reloaded
 }

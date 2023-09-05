@@ -3,6 +3,10 @@ package redis
 import (
 	"math/rand"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/envoyproxy/ratelimit/src/stats"
 
 	"github.com/coocood/freecache"
@@ -14,6 +18,8 @@ import (
 	"github.com/envoyproxy/ratelimit/src/limiter"
 	"github.com/envoyproxy/ratelimit/src/utils"
 )
+
+var tracer = otel.Tracer("redis.fixedCacheImpl")
 
 type fixedRateLimitCacheImpl struct {
 	client Client
@@ -47,6 +53,8 @@ func (this *fixedRateLimitCacheImpl) DoLimit(
 	results := make([]uint32, len(request.Descriptors))
 	var pipeline, perSecondPipeline Pipeline
 
+	hitAddendForRedis := hitsAddend
+	overlimitIndex := -1
 	// Now, actually setup the pipeline, skipping empty cache keys.
 	for i, cacheKey := range cacheKeys {
 		if cacheKey.Key == "" {
@@ -55,14 +63,19 @@ func (this *fixedRateLimitCacheImpl) DoLimit(
 
 		// Check if key is over the limit in local cache.
 		if this.baseRateLimiter.IsOverLimitWithLocalCache(cacheKey.Key) {
-
 			if limits[i].ShadowMode {
 				logger.Debugf("Cache key %s would be rate limited but shadow mode is enabled on this rule", cacheKey.Key)
 			} else {
 				logger.Debugf("cache key is over the limit: %s", cacheKey.Key)
-				isOverLimitWithLocalCache[i] = true
 			}
-
+			isOverLimitWithLocalCache[i] = true
+			hitAddendForRedis = 0
+			overlimitIndex = i
+			continue
+		}
+	}
+	for i, cacheKey := range cacheKeys {
+		if cacheKey.Key == "" || overlimitIndex == i {
 			continue
 		}
 
@@ -78,14 +91,23 @@ func (this *fixedRateLimitCacheImpl) DoLimit(
 			if perSecondPipeline == nil {
 				perSecondPipeline = Pipeline{}
 			}
-			pipelineAppend(this.perSecondClient, &perSecondPipeline, cacheKey.Key, hitsAddend, &results[i], expirationSeconds)
+			pipelineAppend(this.perSecondClient, &perSecondPipeline, cacheKey.Key, hitAddendForRedis, &results[i], expirationSeconds)
 		} else {
 			if pipeline == nil {
 				pipeline = Pipeline{}
 			}
-			pipelineAppend(this.client, &pipeline, cacheKey.Key, hitsAddend, &results[i], expirationSeconds)
+			pipelineAppend(this.client, &pipeline, cacheKey.Key, hitAddendForRedis, &results[i], expirationSeconds)
 		}
 	}
+
+	// Generate trace
+	_, span := tracer.Start(ctx, "Redis Pipeline Execution",
+		trace.WithAttributes(
+			attribute.Int("pipeline length", len(pipeline)),
+			attribute.Int("perSecondPipeline length", len(perSecondPipeline)),
+		),
+	)
+	defer span.End()
 
 	if pipeline != nil {
 		checkError(this.client.PipeDo(pipeline))

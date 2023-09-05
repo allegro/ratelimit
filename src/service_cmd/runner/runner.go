@@ -1,7 +1,8 @@
 package runner
 
 import (
-	"github.com/envoyproxy/ratelimit/src/memory"
+	"context"
+
 	"io"
 	"math/rand"
 	"net/http"
@@ -9,8 +10,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/envoyproxy/ratelimit/src/memory"
+
 	"github.com/envoyproxy/ratelimit/src/metrics"
 	"github.com/envoyproxy/ratelimit/src/stats"
+	"github.com/envoyproxy/ratelimit/src/trace"
 
 	gostats "github.com/lyft/gostats"
 
@@ -20,7 +24,6 @@ import (
 
 	logger "github.com/sirupsen/logrus"
 
-	"github.com/envoyproxy/ratelimit/src/config"
 	"github.com/envoyproxy/ratelimit/src/limiter"
 	"github.com/envoyproxy/ratelimit/src/memcached"
 	"github.com/envoyproxy/ratelimit/src/redis"
@@ -84,6 +87,16 @@ func createLimiter(srv server.Server, s settings.Settings, localCache *freecache
 
 func (runner *Runner) Run() {
 	s := runner.settings
+	if s.TracingEnabled {
+		tp := trace.InitProductionTraceProvider(s.TracingExporterProtocol, s.TracingServiceName, s.TracingServiceNamespace, s.TracingServiceInstanceId, s.TracingSamplingRate)
+		defer func() {
+			if err := tp.Shutdown(context.Background()); err != nil {
+				logger.Printf("Error shutting down tracer provider: %v", err)
+			}
+		}()
+	} else {
+		logger.Infof("Tracing disabled")
+	}
 
 	logLevel, err := logger.ParseLevel(s.LogLevel)
 	if err != nil {
@@ -114,20 +127,21 @@ func (runner *Runner) Run() {
 	runner.mu.Unlock()
 
 	service := ratelimit.NewService(
-		srv.Runtime(),
 		createLimiter(srv, s, localCache, runner.statsManager),
-		config.NewRateLimitConfigLoaderImpl(),
+		srv.Provider(),
 		runner.statsManager,
-		s.RuntimeWatchRoot,
+		srv.HealthChecker(),
 		utils.NewTimeSourceImpl(),
 		s.GlobalShadowMode,
+		s.ForceStartWithoutInitialConfig,
+		s.HealthyWithAtLeastOneConfigLoaded,
 	)
 
 	srv.AddDebugHttpEndpoint(
 		"/rlconfig",
 		"print out the currently loaded configuration for debugging",
 		func(writer http.ResponseWriter, request *http.Request) {
-			if current := service.GetCurrentConfig(); current != nil {
+			if current, _ := service.GetCurrentConfig(); current != nil {
 				io.WriteString(writer, current.Dump())
 			}
 		})
